@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: saveora-bot
+    runtime: docker
+    plan: free
+    region: frankfurt
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /
+    autoDeploy: true
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: DEFAULT_QUALITY
+        value: "720"
+      - key: MAX_FILESIZE_MB
+        value: "49"
+      - key: MAX_DURATION_MIN
+        value: "30"
+      - key: MAX_CONCURRENT
+        value: "1"
+      - key: SEPARATOR_MAX_MINUTES
+        value: "6"

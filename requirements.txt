@@ -1,0 +1,6 @@
+python-telegram-bot>=21.6,<23
+yt-dlp>=2024.11.18
+python-dotenv>=1.0.1
+# فصل الموسيقى على السيرفر (Linux) — نفس محرّك MDX-Net
+numpy>=1.26
+onnxruntime>=1.17
