@@ -1,0 +1,23 @@
+# أسرار ومجلدات محلية لا تُرفع للحاوية
+.env
+.env.*
+*.log
+*.pid
+_cache/
+venv/
+venv312/
+ffmpeg/
+models/
+_real_test/
+_real_work/
+__pycache__/
+*.pyc
+*.wav
+*.mp3
+diag_*.py
+bench_sep.py
+test_*.py
+probe_formats.py
+pe_deps.py
+find_dll.py
+dl.py
