@@ -1,12 +1,15 @@
 """
 فصل سريع للكلام عن الموسيقى — numpy فقط، بلا ONNX، بلا GPU.
 
-الفكرة: الموسيقى المستمرة (باص، أوتار، باد، إيقاع ثابت) تبقى بطيف شبه ثابت
-مع الوقت، أما الكلام فمتقطّع وسريع التغيّر. لذلك نقدّر "مستوى الخلفية المستمر"
-لكل تردد بمتتبّع بطيء (attack/release طويل)، ونطرحه من الطيف الحالي مع قناع ناعم.
+يعمل على مقاطع صغيرة (blocks) حتى لا تتضخم الذاكرة على السيرفرات الصغيرة
+(512 MB)، لذلك يصلح لـ Render free.
 
-النتيجة: أسرع ~100× من MDX (ثوانٍ بدل دقائق) بجودة أقل من نموذج AI لكن مقبولة
-للكلام على خلفية موسيقية.
+الطريقة:
+  1) طيف قصير (N_FFT=1024) لتقدير الطاقة لكل تردد.
+  2) تقدير "الخلفية الموسيقية" بمُرشّح وسيط (median) على مدى زمني ~1.6 ثانية
+     لكل تردد — الموسيقى تدوم، والكلام متقطّع.
+  3) طرح طيفي بمُعامل زيادة + قناع ناعم (Wiener) مع تنعيم زمني/ترددي.
+  4) تقليل الباص العميق والحفيف العالي (موسيقى/ضجيج).
 
 الاستخدام:
     python fast_sep.py in.wav out.wav
@@ -23,6 +26,15 @@ import numpy as np
 SR = 44100
 N_FFT = 1024
 HOP = 256
+
+# حجم الكتلة الواحدة (ثانية) + تراكب — يحدّد الذمّة القصوى
+BLOCK_SEC = 8.0
+OVERLAP_SEC = 0.6
+
+MED_SEC = 1.6        # نافذة الوسيط لتقدير الخلفية
+GROUP_FRAMES = 16    # تجميع الإطارات لتقدير سريع للخلفية (~93 ms)
+OVER_SUB = 1.6       # معامل الطرح الزائد
+MASK_FLOOR = 0.06    # أقل قيمة للقناع (يمنع الاختفاء الكامل)
 
 
 def _hann(n: int) -> np.ndarray:
@@ -96,61 +108,114 @@ def _istft(frames: np.ndarray, length: int) -> np.ndarray:
     return out[:, pad : pad + length]
 
 
+def _band_limit() -> np.ndarray:
+    freqs = np.fft.rfftfreq(N_FFT, 1.0 / SR)
+    band = np.ones_like(freqs, dtype=np.float32)
+    band[freqs < 90] = np.clip(freqs[freqs < 90] / 90.0, 0.10, 1.0)
+    band[freqs > 7500] = np.clip((11000.0 - freqs[freqs > 7500]) / 3500.0, 0.20, 1.0)
+    return band.astype(np.float32)
+
+
+def _coarse_floor(mag: np.ndarray) -> np.ndarray:
+    """تقدير الخلفية المستمرة بكلفة صغيرة: أدنى قيمة في نوافذ قصيرة ثم وسيط.
+
+    الموسيقى مستوى مستمر (أدنى قيمة ≈ مستواها)، والكلام متقطّع (أدنى قيمة منخفض).
+    """
+    bins, t_len = mag.shape
+    g = int(max(1, min(GROUP_FRAMES, t_len)))
+    n_g = t_len // g
+    if n_g < 3:
+        return np.full_like(mag, float(np.percentile(mag, 25)))
+
+    coarse = mag[:, : n_g * g].reshape(bins, n_g, g).min(axis=2)   # (bins, n_g)
+    span = max(3, int(round(MED_SEC * SR / HOP / g)) | 1)
+    pad = span // 2
+    padded = np.pad(coarse, ((0, 0), (pad, pad)), mode="edge")
+    win_view = np.lib.stride_tricks.sliding_window_view(padded, span, axis=1)
+    coarse = np.median(win_view, axis=-1)                          # (bins, n_g)
+
+    floor = np.repeat(coarse, g, axis=1)
+    if floor.shape[1] < t_len:
+        floor = np.concatenate(
+            [floor, np.repeat(coarse[:, -1:], t_len - floor.shape[1], axis=1)], axis=1
+        )
+    return floor.astype(np.float32)
+
+
+def _process_block(
+    seg: np.ndarray, win: np.ndarray, band: np.ndarray
+) -> np.ndarray:
+    """seg: (2, n) → كلام مقدّر (2, n)."""
+    mono = seg.mean(axis=0, dtype=np.float32)
+    wf = _frames(mono[None, :], win)[0]              # (T, N_FFT)
+    mag = np.abs(np.fft.rfft(wf, axis=-1)).T.astype(np.float32)    # (bins, T)
+    t_len = mag.shape[1]
+
+    floor = _coarse_floor(mag)
+
+    # قناع Wiener: نُبقي ما يزيد بوضوح عن الخلفية
+    ratio = mag / (mag + OVER_SUB * floor + 1e-8)
+    mask = np.clip(ratio, MASK_FLOOR, 1.0).astype(np.float32)
+
+    # تنعيم: تردد (3) ثم زمن (5)
+    padded = np.pad(mask, ((1, 1), (0, 0)), mode="edge")
+    mask = (padded[:-2] + padded[1:-1] + padded[2:]) / 3.0
+    k = 5
+    padded = np.pad(mask, ((0, 0), (k // 2, k // 2)), mode="edge")
+    acc = np.zeros_like(mask)
+    for i in range(k):
+        acc += padded[:, i : i + t_len]
+    mask = acc / k
+
+    mask = np.clip(mask * band[:, None], MASK_FLOOR, 1.0).astype(np.float32)
+
+    sp = np.fft.rfft(_frames(seg, win), axis=-1)      # (2, T, bins)
+    sp *= mask.T[None, :, :]
+    out = np.fft.irfft(sp, n=N_FFT, axis=-1).astype(np.float32)
+    return _istft(out, seg.shape[-1])
+
+
 def separate(mix: np.ndarray, sr: int = SR) -> np.ndarray:
-    """mix: (2, N) → كلام مقدّر (2, N)."""
+    """mix: (2, N) → كلام مقدّر (2, N). يعمل على كتل لتقليل الذاكرة."""
     x = mix
     if sr != SR:
         x = resample_linear(x, sr, SR)
 
     win = _hann(N_FFT)
-    # نقنع قناة واحدة (متوسط) لتقدير القناع، ثم نطبّقه على الاستيريو
-    mono = x.mean(axis=0, dtype=np.float32)
-    frames = _frames(mono[None, :], win)[0]          # (T, N_FFT)
-    mag = np.abs(np.fft.rfft(frames, axis=-1)).T     # (bins, T)
+    band = _band_limit()
 
-    bins, n_frames = mag.shape
-    hop_rate = SR / HOP                              # إطار/ثانية ≈ 172
+    n = x.shape[-1]
+    block = max(N_FFT * 8, int(BLOCK_SEC * SR))
+    ramp = max(N_FFT, int(OVERLAP_SEC * SR))
+    step = max(N_FFT * 4, block - ramp)
 
-    # متتبّع "الخلفية المستمرة": يصعد ببطء (0.8 ثانية) ويهبط ببطء (1.8 ثانية)
-    a_up = float(1.0 - np.exp(-1.0 / (0.8 * hop_rate)))
-    a_dn = float(1.0 - np.exp(-1.0 / (1.8 * hop_rate)))
+    out = np.zeros_like(x)
+    wsum = np.zeros(n, dtype=np.float32)
 
-    env = np.zeros(bins, dtype=np.float32)
-    floor = np.zeros_like(mag)
-    for t in range(n_frames):
-        cur = mag[:, t]
-        up = cur > env
-        env = np.where(up, env + (cur - env) * a_up, env + (cur - env) * a_dn)
-        floor[:, t] = env
+    pos = 0
+    while pos < n:
+        end = min(n, pos + block)
+        seg = x[:, pos:end]
+        if seg.shape[-1] < N_FFT * 2:           # ذيل قصير جداً — نكمله
+            seg = np.pad(seg, ((0, 0), (0, N_FFT * 2 - seg.shape[-1])), mode="constant")
+        clean = _process_block(seg, win, band)
+        clean = clean[:, : end - pos]
 
-    # قناع ناعم: نُبقي ما يزيد على الخلفية بشكل واضح
-    ratio = np.clip((mag - 1.15 * floor) / (mag + 1e-8), 0.0, 1.0)
+        w = np.ones(clean.shape[-1], dtype=np.float32)
+        r = min(ramp, clean.shape[-1] // 2)
+        if r > 0:
+            if pos > 0:
+                w[:r] = np.linspace(0.0, 1.0, r, dtype=np.float32)
+            if end < n:
+                w[-r:] = np.linspace(1.0, 0.0, r, dtype=np.float32)
+        out[:, pos:end] += clean * w
+        wsum[pos:end] += w
+        if end >= n:
+            break
+        pos += step
 
-    # تنعيم زمني بسيط لتقليل "الطقطقة" المعدنية
-    k = 3
-    ker = np.ones(k, dtype=np.float32) / k
-    pad = k // 2
-    padded = np.pad(ratio, ((0, 0), (pad, pad)), mode="edge")
-    smooth = np.zeros_like(ratio)
-    for i in range(k):
-        smooth += padded[:, i : i + n_frames]
-    ratio = smooth / k
-
-    # حدّ ترددي: خفض الباص العميق (موسيقى) والحفيف العالي
-    freqs = np.fft.rfftfreq(N_FFT, 1.0 / SR)
-    band = np.ones_like(freqs, dtype=np.float32)
-    band[freqs < 90] = np.clip(freqs[freqs < 90] / 90.0, 0.15, 1.0)
-    band[freqs > 7500] = np.clip((11000 - freqs[freqs > 7500]) / 3500.0, 0.25, 1.0)
-
-    mask = ratio * band[:, None]
-    mask = np.clip(mask, 0.0, 1.0).astype(np.float32)
-
-    # تطبيق القناع على القناتين
-    wf = _frames(x, win)                             # (2, T, N_FFT)
-    sp = np.fft.rfft(wf, axis=-1)                    # (2, T, bins)
-    sp *= mask.T[None, :, :]
-    out = np.fft.irfft(sp, n=N_FFT, axis=-1).astype(np.float32)
-    return _istft(out, x.shape[-1])
+    out /= np.maximum(wsum, 1e-8)[None, :]
+    return out.astype(np.float32)
 
 
 def main() -> int:
