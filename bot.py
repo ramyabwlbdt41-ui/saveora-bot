@@ -31,7 +31,7 @@ from typing import Any
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction
-from telegram.error import NetworkError, RetryAfter, TimedOut
+from telegram.error import BadRequest, NetworkError, RetryAfter, TimedOut
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -76,6 +76,8 @@ COOKIES_BROWSER = os.getenv("COOKIES_FROM_BROWSER", "").strip()
 # فصل الموسيقى
 SEP_MODEL = os.getenv("SEPARATOR_MODEL", "Kim_Vocal_2.onnx")
 MODEL_DIR = HERE / "models"
+# المحرّك: fast = DSP سريع (ثوانٍ، ذاكرة صغيرة) · mdx = نموذج AI (جودة أعلى، بطيء جداً)
+SEP_ENGINE = (os.getenv("SEPARATOR_ENGINE", "fast") or "fast").strip().lower()
 
 
 def _find_sep_python() -> str | None:
@@ -205,10 +207,24 @@ def media_keyboard(
                 InlineKeyboardButton("🔇 بدون صوت", callback_data=f"mx|mute|{token}"),
             ]
         )
-        rows.append([InlineKeyboardButton("⚡️ إزالة سريعة (جودة متوسطة)", callback_data=f"mx|fast|{token}")])
     if quality and quality not in {"1080", "audio"}:
         rows.append([InlineKeyboardButton("⬆️ نسخة 1080p", callback_data=f"mx|hd|{token}")])
     return InlineKeyboardMarkup(rows)
+
+
+async def safe_edit(q, text: str, **kw) -> bool:
+    """تعديل رسالة الكولباك دون أن يوقف التنفيذ إن كانت مطابقة أو قديمة."""
+    try:
+        await q.edit_message_text(text, **kw)
+        return True
+    except BadRequest as exc:
+        if "not modified" in str(exc).lower():
+            return True
+        log.warning("edit failed: %s", str(exc)[:160])
+        return False
+    except Exception as exc:  # noqa: BLE001
+        log.warning("edit failed: %s", str(exc)[:160])
+        return False
 
 
 def admin_keyboard() -> InlineKeyboardMarkup:
@@ -330,7 +346,7 @@ def ffmpeg_exe() -> str | None:
 
 
 def separator_ready() -> bool:
-    """هل محرّك الفصل متاح (بيئة 3.12 + numpy + onnxruntime + النموذج)؟"""
+    """هل محرّك الفصل متاح؟ (fast: numpy فقط · mdx: numpy + onnxruntime + النموذج)"""
     global _SEP_OK, _SEP_AT
     now = time.time()
     if _SEP_OK is True:
@@ -339,7 +355,13 @@ def separator_ready() -> bool:
         return False
     _SEP_AT = now
 
-    if not SEP_PYTHON or not (MODEL_DIR / SEP_MODEL).exists():
+    if not SEP_PYTHON:
+        _SEP_OK = False
+        return False
+    if SEP_ENGINE != "mdx":
+        _SEP_OK = True
+        return True
+    if not (MODEL_DIR / SEP_MODEL).exists():
         _SEP_OK = False
         return False
     try:
@@ -534,6 +556,8 @@ def separate_fast(src_audio: Path, outdir: Path) -> Path:
         timeout=1800,
     )
     if proc.returncode != 0 or not dest.exists():
+        if proc.returncode in (-9, 137):
+            raise RuntimeError("الذاكرة غير كافية لمعالجة هذا المقطع — جرّب مقطعاً أقصر")
         raise RuntimeError(((proc.stderr or "") + (proc.stdout or ""))[-300:] or "فشل الفصل السريع")
     return dest
 
@@ -602,7 +626,12 @@ def build_stripped(
         run_ffmpeg(["-y", "-i", str(src), "-an", "-c:v", "copy", str(out)])
         return out
 
-    vocals = separate_fast(wav, workdir) if mode == "fast" else separate_vocals(wav, workdir, prog)
+    # الافتراضي على السيرفر: محرّك DSP السريع (ثوانٍ + ذاكرة صغيرة)
+    # MDX (جودة أعلى بكثير في الوقت) يعمل فقط إذا ضبطت SEPARATOR_ENGINE=mdx
+    if mode == "fast" or SEP_ENGINE != "mdx":
+        vocals = separate_fast(wav, workdir)
+    else:
+        vocals = separate_vocals(wav, workdir, prog)
 
     if mode == "voice":
         out = workdir / "voice.mp3"
@@ -917,17 +946,21 @@ async def do_broadcast(context: ContextTypes.DEFAULT_TYPE, msg) -> None:
 
 async def on_admin_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
-    await q.answer()
+    try:
+        await q.answer()
+    except Exception:
+        pass
     uid = q.from_user.id
     if not is_admin(uid):
-        await q.edit_message_text("⛔ هذا الزر للمالك فقط.")
+        await safe_edit(q, "⛔ هذا الزر للمالك فقط.")
         return
 
     act = q.data.split("|", 1)[1] if "|" in q.data else ""
 
     if act == "bc":
         PENDING[uid] = "broadcast"
-        await q.edit_message_text(
+        await safe_edit(
+            q,
             "📢 <b>أرسل الرسالة الآن</b>\nنص أو صورة أو فيديو — وسأرسلها للجميع.\n"
             "للإلغاء: /cancel",
             parse_mode="HTML",
@@ -938,7 +971,8 @@ async def on_admin_action(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         PENDING[uid] = "channel"
         c = conf()
         cur = c.get("channel") or "غير محددة"
-        await q.edit_message_text(
+        await safe_edit(
+            q,
             f"📡 <b>القناة الحالية:</b> <code>{html.escape(str(cur))}</code>\n\n"
             "أرسل معرّف القناة الجديد مثل <code>@mychannel</code> أو رابطها.\n"
             "⚠️ يجب أن يكون البوت <b>مشرفاً</b> في القناة.\n"
@@ -950,11 +984,12 @@ async def on_admin_action(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if act == "gate":
         c = conf()
         if not c.get("channel"):
-            await q.edit_message_text("⚠️ حدّد القناة أولاً من الزر 📡", reply_markup=admin_keyboard())
+            await safe_edit(q, "⚠️ حدّد القناة أولاً من الزر 📡", reply_markup=admin_keyboard())
             return
         c["gate"] = not bool(c.get("gate"))
         save_json(CONF_FILE, c)
-        await q.edit_message_text(
+        await safe_edit(
+            q,
             f"🔐 الاشتراك الإجباري: <b>{'يعمل ✅' if c['gate'] else 'متوقف ⛔️'}</b>",
             parse_mode="HTML",
             reply_markup=admin_keyboard(),
@@ -962,11 +997,14 @@ async def on_admin_action(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     ids = all_user_ids()
-    await q.edit_message_text(
+    stamp = time.strftime("%H:%M:%S")
+    await safe_edit(
+        q,
         "📊 <b>الإحصائيات</b>\n━━━━━━━━━━━━━━━━━━\n"
         f"👥 المستخدمون: <b>{len(ids)}</b>\n"
         f"📡 القناة: <code>{html.escape(str(conf().get('channel') or 'غير محددة'))}</code>\n"
-        f"🔐 الإجباري: <b>{'يعمل' if conf().get('gate') else 'متوقف'}</b>",
+        f"🔐 الإجباري: <b>{'يعمل' if conf().get('gate') else 'متوقف'}</b>\n"
+        f"<i>{stamp}</i>",
         parse_mode="HTML",
         reply_markup=admin_keyboard(),
     )
@@ -1313,19 +1351,33 @@ async def download_and_send(
 
 async def on_media_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
-    await q.answer()
+    try:
+        await q.answer("جارٍ التنفيذ…")
+    except Exception:
+        pass
 
     try:
         _, mode, token = q.data.split("|", 2)
     except ValueError:
         return
 
+    uid = q.from_user.id
     job = JOBS.get(token)
+    log.info(
+        "media action: mode=%s user=%s job=%s jobs=%s",
+        mode, uid, bool(job), len(JOBS),
+    )
+
     if not job:
-        await q.edit_message_text("⌛️ انتهت صلاحية الملف — أرسل الرابط من جديد.")
+        await safe_edit(
+            q,
+            "⌛️ <b>انتهت صلاحية هذا الملف</b>\n"
+            "أرسل الرابط من جديد وستصلك الأزرار مباشرة.",
+            parse_mode="HTML",
+        )
         return
-    if job["user"] != q.from_user.id:
-        await q.edit_message_text("⛔ هذا الملف ليس لك.")
+    if job["user"] != uid:
+        await safe_edit(q, "⛔ هذا الملف ليس لك.")
         return
 
     # ترقية إلى 1080p: يعيد الجلب بالجودة الأعلى ويرسل نسخة جديدة
@@ -1337,50 +1389,46 @@ async def on_media_action(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             q.message,
             job["url"],
             "1080",
-            q.from_user.id,
+            uid,
             edit=True,
             progressive_first=not is_yt,
         )
         return
 
     if not ffmpeg_exe():
-        await q.edit_message_text(
-            "🎞 <b>يحتاج ffmpeg</b>\n\n"
-            "ثبّته بأمر واحد في PowerShell:\n"
-            "<code>winget install Gyan.FFmpeg</code>\n"
-            "ثم أعد تشغيل البوت.",
+        await safe_edit(
+            q,
+            "🎞 <b>ffmpeg غير متاح على السيرفر</b>\nأبلغ المالك.",
             parse_mode="HTML",
         )
         return
 
-    if mode in {"music", "voice"}:
-        if not separator_ready():
-            await q.edit_message_text(
-                "🎵 <b>محرّك الفصل غير جاهز بعد</b>\n\n"
-                f"• النموذج: <code>{'موجود' if (MODEL_DIR / SEP_MODEL).exists() else 'ينزّل'}</code>\n"
-                f"• المكتبات: <code>{'جاهزة' if SEP_PYTHON else 'تنزّل'}</code>\n\n"
-                "أعد المحاولة بعد قليل.",
-                parse_mode="HTML",
-            )
-            return
+    if mode in {"music", "voice", "fast"} and not separator_ready():
+        await safe_edit(
+            q,
+            "🎵 <b>محرّك الفصل غير جاهز بعد</b>\n\n"
+            f"• المكتبات: <code>{'جاهزة' if SEP_PYTHON else 'تنزّل'}</code>\n\n"
+            "أعد المحاولة بعد قليل.",
+            parse_mode="HTML",
+        )
+        return
 
-    if q.message.chat.type != "private":
-        pass
-
-    # حدود المعالجة: الفصل على المعالج يحتاج وقتاً يتناسب مع طول المقطع
-    if mode in {"music", "voice"} and job["duration"] and job["duration"] > SEP_MAX_MINUTES * 60:
-        await q.edit_message_text(
+    # حدود المعالجة
+    if mode in {"music", "voice", "fast"} and job["duration"] and job["duration"] > SEP_MAX_MINUTES * 60:
+        await safe_edit(
+            q,
             f"⏱ <b>المقطع {fmt_duration(job['duration'])} طويل للفصل</b>\n"
-            f"الحد الحالي {SEP_MAX_MINUTES} دقيقة (الفصل يعمل على المعالج).\n"
-            "استخدم 🔇 بدون صوت للمقاطع الطويلة، أو ارفع الحد من <code>.env</code>.",
+            f"الحد الحالي {SEP_MAX_MINUTES} دقيقة.\n"
+            "استخدم 🔇 بدون صوت للمقاطع الطويلة.",
             parse_mode="HTML",
         )
         return
 
-    await q.edit_message_text(
-        "🎧 <b>1/3 · استخراج الصوت…</b>", parse_mode="HTML"
-    )
-    await context.bot.send_chat_action(q.message.chat_id, ChatAction.UPLOAD_VOICE)
+    await safe_edit(q, "🎧 <b>1/3 · استخراج الصوت…</b>", parse_mode="HTML")
+    try:
+        await context.bot.send_chat_action(q.message.chat_id, ChatAction.UPLOAD_VOICE)
+    except Exception:
+        pass
 
     loop = asyncio.get_running_loop()
     workdir = Path(tempfile.mkdtemp(prefix="saveora_edit_"))
@@ -1388,82 +1436,90 @@ async def on_media_action(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     async with SEP_SEMAPHORE:
         try:
-            if mode == "fast":
-                await q.edit_message_text("⚡️ <b>فصل سريع…</b>", parse_mode="HTML")
-            elif mode in {"music", "voice"}:
-                await q.edit_message_text(
+            if mode == "mute":
+                await safe_edit(q, "🔇 <b>حذف المسار الصوتي…</b>", parse_mode="HTML")
+            else:
+                await safe_edit(
+                    q,
                     "🎧 <b>2/3 · فصل الكلام عن الموسيقى…</b>\n"
-                    f"<i>يعمل على المعالج — تقريباً {max(1, (job['duration'] or 0) // 30)} دقيقة</i>",
+                    "<i>ثوانٍ قليلة…</i>",
                     parse_mode="HTML",
                 )
-            if mode == "mute":
-                await q.edit_message_text("🔇 <b>حذف المسار الصوتي…</b>", parse_mode="HTML")
 
+            log.info("build_stripped start: mode=%s dur=%s", mode, job.get("duration"))
             task = loop.run_in_executor(None, build_stripped, job, workdir, mode, prog)
 
             last_edit = 0.0
             while not task.done():
-                await asyncio.sleep(3)
+                await asyncio.sleep(2)
                 sep = prog.get("sep")
-                if not sep or mode == "mute":
-                    continue
-                if time.time() - last_edit < 6:
+                if not sep or mode == "mute" or time.time() - last_edit < 6:
                     continue
                 last_edit = time.time()
                 n, total = sep
                 pct = n / max(1, total) * 100
-                try:
-                    await q.edit_message_text(
-                        f"🎧 <b>فصل الكلام عن الموسيقى</b>\n"
-                        f"<code>{progress_bar(pct)}</code> {pct:.0f}%\n"
-                        f"<i>الجزء {n} من {total}</i>",
-                        parse_mode="HTML",
-                    )
-                except Exception:
-                    pass
+                await safe_edit(
+                    q,
+                    f"🎧 <b>فصل الكلام عن الموسيقى</b>\n"
+                    f"<code>{progress_bar(pct)}</code> {pct:.0f}%\n"
+                    f"<i>الجزء {n} من {total}</i>",
+                    parse_mode="HTML",
+                )
 
             out = await asyncio.wait_for(task, timeout=7200)
+            log.info("build_stripped done: %s (%.1f MB)", out.name, out.stat().st_size / 1048576)
 
-            await q.edit_message_text("📤 <b>3/3 · جاري الإرسال…</b>", parse_mode="HTML")
+            await safe_edit(q, "📤 <b>3/3 · جاري الإرسال…</b>", parse_mode="HTML")
             caption = {
                 "music": "🎵 <b>بدون موسيقى</b> — الكلام فقط",
                 "voice": "🎤 <b>الكلام فقط</b>",
                 "mute": "🔇 <b>بدون صوت</b>",
                 "fast": "⚡️ <b>إزالة سريعة</b> — كلام بدون موسيقى",
-            }[mode]
+            }.get(mode, "✅ <b>جاهز</b>")
 
-            with open(out, "rb") as fh:
-                if mode == "voice":
-                    await context.bot.send_audio(
-                        chat_id=q.message.chat_id, audio=fh, filename=out.name,
-                        caption=caption, parse_mode="HTML",
-                        title=(job["title"] or "")[:60],
-                        read_timeout=600, write_timeout=900,
-                    )
-                elif mode == "mute":
-                    await context.bot.send_video(
-                        chat_id=q.message.chat_id, video=fh, filename=out.name,
-                        caption=caption, parse_mode="HTML",
-                        width=job["width"], height=job["height"],
-                        duration=job["duration"] or None,
-                        supports_streaming=True,
-                        read_timeout=600, write_timeout=900,
-                    )
-                else:
-                    await context.bot.send_video(
-                        chat_id=q.message.chat_id, video=fh, filename=out.name,
-                        caption=caption, parse_mode="HTML",
-                        width=job["width"], height=job["height"],
-                        duration=job["duration"] or None,
-                        supports_streaming=True,
-                        read_timeout=600, write_timeout=900,
-                    )
-            await q.delete_message()
+            async def _send() -> None:
+                with open(out, "rb") as fh:
+                    if mode == "voice":
+                        await context.bot.send_audio(
+                            chat_id=q.message.chat_id, audio=fh, filename=out.name,
+                            caption=caption, parse_mode="HTML",
+                            title=(job["title"] or "")[:60],
+                            read_timeout=600, write_timeout=900,
+                        )
+                    else:
+                        await context.bot.send_video(
+                            chat_id=q.message.chat_id, video=fh, filename=out.name,
+                            caption=caption, parse_mode="HTML",
+                            width=job["width"], height=job["height"],
+                            duration=job["duration"] or None,
+                            supports_streaming=True,
+                            read_timeout=600, write_timeout=900,
+                        )
+
+            last_err: Exception | None = None
+            for attempt in range(3):
+                try:
+                    await _send()
+                    last_err = None
+                    break
+                except (TimedOut, NetworkError) as exc:
+                    last_err = exc
+                    log.warning("media send %s/3: %r", attempt + 1, exc)
+                    if attempt < 2:
+                        await asyncio.sleep(3 * (attempt + 1))
+            if last_err is not None:
+                raise last_err
+
+            try:
+                await q.delete_message()
+            except Exception:
+                pass
         except asyncio.TimeoutError:
-            await q.edit_message_text("⌛️ المعالجة أخذت وقتاً طويلاً — جرّب مقطعاً أقصر.")
+            await safe_edit(q, "⌛️ المعالجة أخذت وقتاً طويلاً — جرّب مقطعاً أقصر.")
         except Exception as exc:  # noqa: BLE001
             log.exception("media action failed")
-            await q.edit_message_text(
+            await safe_edit(
+                q,
                 f"❌ <b>فشلت المعالجة</b>\n\n<code>{html.escape(str(exc)[:300])}</code>",
                 parse_mode="HTML",
             )
