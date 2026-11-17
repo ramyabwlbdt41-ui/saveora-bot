@@ -14,6 +14,7 @@ import asyncio
 import html
 import http.server
 import importlib.util
+import json
 import logging
 import os
 import re
@@ -30,7 +31,7 @@ from typing import Any
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction
-from telegram.error import NetworkError, TimedOut
+from telegram.error import NetworkError, RetryAfter, TimedOut
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -117,6 +118,19 @@ LADDER = ["1080", "720", "480", "360", "audio"]
 # الجودة الافتراضية: 720p (أسرع وأخف) — و1080 متاح بزر
 DEFAULT_QUALITY = os.getenv("DEFAULT_QUALITY", "720")
 
+# ---------------------------------------------------------------------------
+# لوحة المالك: معرّفات المدراء (من .env) + بيانات محفوظة محلياً
+# ---------------------------------------------------------------------------
+ADMIN_IDS: set[int] = {
+    int(x) for x in re.split(r"[^\d]+", os.getenv("ADMIN_IDS", "")) if x.isdigit()
+}
+
+DATA_DIR = HERE / "_data"
+USERS_FILE = DATA_DIR / "users.json"
+CONF_FILE = DATA_DIR / "conf.json"
+# انتظار إدخال من المدير: uid → "broadcast" | "channel"
+PENDING: dict[int, str] = {}
+
 # ملفات محفوظة مؤقتاً حتى تعمل الأزرار بلا إعادة تحميل
 CACHE_DIR = HERE / "_cache"
 JOBS: dict[str, dict[str, Any]] = {}
@@ -191,9 +205,24 @@ def media_keyboard(
                 InlineKeyboardButton("🔇 بدون صوت", callback_data=f"mx|mute|{token}"),
             ]
         )
+        rows.append([InlineKeyboardButton("⚡️ إزالة سريعة (جودة متوسطة)", callback_data=f"mx|fast|{token}")])
     if quality and quality not in {"1080", "audio"}:
         rows.append([InlineKeyboardButton("⬆️ نسخة 1080p", callback_data=f"mx|hd|{token}")])
     return InlineKeyboardMarkup(rows)
+
+
+def admin_keyboard() -> InlineKeyboardMarkup:
+    c = conf()
+    gate = "✅ يعمل" if c.get("gate") else "⛔️ متوقف"
+    ch = str(c.get("channel") or "") or "غير محددة"
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("📢 نشر رسالة للجميع", callback_data="adm|bc")],
+            [InlineKeyboardButton(f"📡 القناة: {ch}", callback_data="adm|ch")],
+            [InlineKeyboardButton(f"🔐 اشتراك إجباري: {gate}", callback_data="adm|gate")],
+            [InlineKeyboardButton("📊 إحصائيات المستخدمين", callback_data="adm|stats")],
+        ]
+    )
 
 
 # ----------------------------------------------------------------------------
@@ -419,6 +448,96 @@ def prune_jobs() -> None:
         Path(job["path"]).unlink(missing_ok=True)
 
 
+# ----------------------------------------------------------------------------
+# المستخدمون + لوحة المالك
+# ----------------------------------------------------------------------------
+
+def load_json(path: Path, default: Any) -> Any:
+    try:
+        return json.loads(path.read_text("utf-8"))
+    except Exception:
+        return default
+
+
+def save_json(path: Path, data: Any) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False), "utf-8")
+        tmp.replace(path)
+    except Exception:
+        log.exception("save failed: %s", path)
+
+
+def track_user(uid: int, name: str) -> None:
+    users = load_json(USERS_FILE, {})
+    if not isinstance(users, dict):
+        users = {}
+    key = str(uid)
+    if key not in users:
+        users[key] = {"name": (name or "")[:60], "ts": int(time.time())}
+        save_json(USERS_FILE, users)
+
+
+def all_user_ids() -> list[int]:
+    users = load_json(USERS_FILE, {})
+    return sorted(int(k) for k in users if str(k).isdigit())
+
+
+def conf() -> dict[str, Any]:
+    c = load_json(CONF_FILE, {})
+    if not isinstance(c, dict):
+        c = {}
+    c.setdefault("channel", "")
+    c.setdefault("gate", False)
+    return c
+
+
+def is_admin(uid: int) -> bool:
+    return uid in ADMIN_IDS
+
+
+def channel_link(ch: str) -> str:
+    ch = (ch or "").strip()
+    if ch.startswith("http"):
+        return ch
+    return f"https://t.me/{ch.lstrip('@')}"
+
+
+async def gate_ok(bot: Any, uid: int) -> bool:
+    c = conf()
+    ch = str(c.get("channel") or "").strip()
+    if not ch or not c.get("gate"):
+        return True
+    try:
+        m = await bot.get_chat_member(ch, uid)
+        return m.status in {"member", "administrator", "creator"}
+    except Exception:
+        return True
+
+
+def separate_fast(src_audio: Path, outdir: Path) -> Path:
+    """فصل سريع بالـ DSP (ثوانٍ بدل دقائق) — جودة متوسطة."""
+    py = SEP_PYTHON or sys.executable
+    worker = HERE / "fast_sep.py"
+    if not worker.exists():
+        raise RuntimeError("fast_sep.py غير موجود")
+    outdir.mkdir(parents=True, exist_ok=True)
+    dest = outdir / "fast_vocals.wav"
+    proc = subprocess.run(
+        [py, "-u", str(worker), str(src_audio), str(dest)],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        cwd=str(HERE),
+        timeout=1800,
+    )
+    if proc.returncode != 0 or not dest.exists():
+        raise RuntimeError(((proc.stderr or "") + (proc.stdout or ""))[-300:] or "فشل الفصل السريع")
+    return dest
+
+
 def separate_vocals(src_audio: Path, outdir: Path, prog: dict[str, Any] | None = None) -> Path:
     """يفصل الكلام/الغناء عن الموسيقى عبر عامل خارجي (بيئة 3.12)."""
     py = SEP_PYTHON
@@ -483,7 +602,7 @@ def build_stripped(
         run_ffmpeg(["-y", "-i", str(src), "-an", "-c:v", "copy", str(out)])
         return out
 
-    vocals = separate_vocals(wav, workdir, prog)
+    vocals = separate_fast(wav, workdir) if mode == "fast" else separate_vocals(wav, workdir, prog)
 
     if mode == "voice":
         out = workdir / "voice.mp3"
@@ -714,6 +833,158 @@ async def on_ui_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 # ----------------------------------------------------------------------------
+# لوحة المالك (نشر + قناة إجبارية)
+# ----------------------------------------------------------------------------
+
+async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not is_admin(user.id):
+        return
+    await update.message.reply_text(
+        "🛠 <b>لوحة المالك</b>\n━━━━━━━━━━━━━━━━━━\n"
+        f"👥 مستخدمون: <b>{len(all_user_ids())}</b>",
+        parse_mode="HTML",
+        reply_markup=admin_keyboard(),
+    )
+
+
+async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    uid = update.effective_user.id
+    if PENDING.pop(uid, None):
+        await update.message.reply_text("تم الإلغاء.")
+    else:
+        await update.message.reply_text("لا يوجد شيء للإلغاء.")
+
+
+async def save_channel(msg) -> None:
+    raw = (msg.text or "").strip()
+    ch = raw.rstrip("/")
+    if "t.me/" in ch:
+        ch = ch.split("t.me/", 1)[1].split("?")[0]
+    if not ch:
+        await msg.reply_text("❌ أرسل معرّفاً صالحاً مثل <code>@mychannel</code>", parse_mode="HTML")
+        return
+    if not ch.startswith("@") and not ch.startswith("-"):
+        ch = "@" + ch
+    c = conf()
+    c["channel"] = ch
+    save_json(CONF_FILE, c)
+    try:
+        chat = await msg.get_bot().get_chat(ch)
+        title = chat.title or chat.username or ch
+    except Exception:
+        title = ch
+    await msg.reply_text(
+        f"✅ تم حفظ القناة: <b>{html.escape(str(title))}</b>\n"
+        "لتشغيل الاشتراك الإجباري اضغط الزر 🔐 من /admin.",
+        parse_mode="HTML",
+        reply_markup=admin_keyboard(),
+    )
+
+
+async def do_broadcast(context: ContextTypes.DEFAULT_TYPE, msg) -> None:
+    ids = all_user_ids()
+    if not ids:
+        await msg.reply_text("👥 لا يوجد مستخدمون مسجّلون بعد.")
+        return
+    note = await msg.reply_text(f"📢 جاري النشر إلى {len(ids)} مستخدم…")
+    ok = fail = 0
+    for i, uid in enumerate(ids, 1):
+        try:
+            await msg.copy(chat_id=uid)
+            ok += 1
+        except RetryAfter as exc:
+            await asyncio.sleep(min(30, int(getattr(exc, "retry_after", 5)) + 1))
+            try:
+                await msg.copy(chat_id=uid)
+                ok += 1
+            except Exception:
+                fail += 1
+        except Exception:
+            fail += 1
+        await asyncio.sleep(0.05)
+        if i % 25 == 0:
+            try:
+                await note.edit_text(f"📢 {i}/{len(ids)} …")
+            except Exception:
+                pass
+    await note.edit_text(
+        f"✅ <b>انتهى النشر</b>\nوصل: <b>{ok}</b> · فشل: <b>{fail}</b>",
+        parse_mode="HTML",
+        reply_markup=admin_keyboard(),
+    )
+
+
+async def on_admin_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    await q.answer()
+    uid = q.from_user.id
+    if not is_admin(uid):
+        await q.edit_message_text("⛔ هذا الزر للمالك فقط.")
+        return
+
+    act = q.data.split("|", 1)[1] if "|" in q.data else ""
+
+    if act == "bc":
+        PENDING[uid] = "broadcast"
+        await q.edit_message_text(
+            "📢 <b>أرسل الرسالة الآن</b>\nنص أو صورة أو فيديو — وسأرسلها للجميع.\n"
+            "للإلغاء: /cancel",
+            parse_mode="HTML",
+        )
+        return
+
+    if act == "ch":
+        PENDING[uid] = "channel"
+        c = conf()
+        cur = c.get("channel") or "غير محددة"
+        await q.edit_message_text(
+            f"📡 <b>القناة الحالية:</b> <code>{html.escape(str(cur))}</code>\n\n"
+            "أرسل معرّف القناة الجديد مثل <code>@mychannel</code> أو رابطها.\n"
+            "⚠️ يجب أن يكون البوت <b>مشرفاً</b> في القناة.\n"
+            "للإلغاء: /cancel",
+            parse_mode="HTML",
+        )
+        return
+
+    if act == "gate":
+        c = conf()
+        if not c.get("channel"):
+            await q.edit_message_text("⚠️ حدّد القناة أولاً من الزر 📡", reply_markup=admin_keyboard())
+            return
+        c["gate"] = not bool(c.get("gate"))
+        save_json(CONF_FILE, c)
+        await q.edit_message_text(
+            f"🔐 الاشتراك الإجباري: <b>{'يعمل ✅' if c['gate'] else 'متوقف ⛔️'}</b>",
+            parse_mode="HTML",
+            reply_markup=admin_keyboard(),
+        )
+        return
+
+    ids = all_user_ids()
+    await q.edit_message_text(
+        "📊 <b>الإحصائيات</b>\n━━━━━━━━━━━━━━━━━━\n"
+        f"👥 المستخدمون: <b>{len(ids)}</b>\n"
+        f"📡 القناة: <code>{html.escape(str(conf().get('channel') or 'غير محددة'))}</code>\n"
+        f"🔐 الإجباري: <b>{'يعمل' if conf().get('gate') else 'متوقف'}</b>",
+        parse_mode="HTML",
+        reply_markup=admin_keyboard(),
+    )
+
+
+async def on_admin_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """نشر صورة/فيديو/ملف من المدير."""
+    msg = update.message
+    user = update.effective_user
+    if msg is None or not is_admin(user.id):
+        return
+    if PENDING.get(user.id) != "broadcast":
+        return
+    PENDING.pop(user.id, None)
+    await do_broadcast(context, msg)
+
+
+# ----------------------------------------------------------------------------
 # استقبال الرابط → تحميل فوري
 # ----------------------------------------------------------------------------
 
@@ -725,6 +996,29 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     user = update.effective_user
     if not is_allowed(user.id):
         await msg.reply_text("⛔ هذا البوت خاص.")
+        return
+
+    track_user(user.id, user.first_name or "")
+
+    # إدخال من لوحة المالك
+    if is_admin(user.id) and PENDING.get(user.id):
+        kind = PENDING.pop(user.id, "")
+        if kind == "broadcast":
+            await do_broadcast(context, msg)
+            return
+        if kind == "channel":
+            await save_channel(msg)
+            return
+
+    if not await gate_ok(context.bot, user.id):
+        ch = str(conf().get("channel") or "")
+        await msg.reply_text(
+            "🔐 <b>للاستخدام اشترك بالقناة أولاً</b>\nثم أرسل الرابط من جديد.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("📡 اشترك الآن", url=channel_link(ch))]]
+            ),
+        )
         return
 
     match = URL_RE.search(msg.text)
@@ -1059,15 +1353,16 @@ async def on_media_action(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         return
 
-    if mode in {"music", "voice"} and not separator_ready():
-        await q.edit_message_text(
-            "🎵 <b>محرّك الفصل غير جاهز بعد</b>\n\n"
-            f"• النموذج: <code>{'موجود' if (MODEL_DIR / SEP_MODEL).exists() else 'ينزّل'}</code>\n"
-            f"• المكتبات: <code>{'جاهزة' if SEP_PYTHON else 'تنزّل'}</code>\n\n"
-            "أعد المحاولة بعد قليل.",
-            parse_mode="HTML",
-        )
-        return
+    if mode in {"music", "voice"}:
+        if not separator_ready():
+            await q.edit_message_text(
+                "🎵 <b>محرّك الفصل غير جاهز بعد</b>\n\n"
+                f"• النموذج: <code>{'موجود' if (MODEL_DIR / SEP_MODEL).exists() else 'ينزّل'}</code>\n"
+                f"• المكتبات: <code>{'جاهزة' if SEP_PYTHON else 'تنزّل'}</code>\n\n"
+                "أعد المحاولة بعد قليل.",
+                parse_mode="HTML",
+            )
+            return
 
     if q.message.chat.type != "private":
         pass
@@ -1093,7 +1388,9 @@ async def on_media_action(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     async with SEP_SEMAPHORE:
         try:
-            if mode in {"music", "voice"}:
+            if mode == "fast":
+                await q.edit_message_text("⚡️ <b>فصل سريع…</b>", parse_mode="HTML")
+            elif mode in {"music", "voice"}:
                 await q.edit_message_text(
                     "🎧 <b>2/3 · فصل الكلام عن الموسيقى…</b>\n"
                     f"<i>يعمل على المعالج — تقريباً {max(1, (job['duration'] or 0) // 30)} دقيقة</i>",
@@ -1132,6 +1429,7 @@ async def on_media_action(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 "music": "🎵 <b>بدون موسيقى</b> — الكلام فقط",
                 "voice": "🎤 <b>الكلام فقط</b>",
                 "mute": "🔇 <b>بدون صوت</b>",
+                "fast": "⚡️ <b>إزالة سريعة</b> — كلام بدون موسيقى",
             }[mode]
 
             with open(out, "rb") as fh:
@@ -1252,8 +1550,17 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("id", cmd_id))
     app.add_handler(CommandHandler("stats", cmd_stats))
+    app.add_handler(CommandHandler("admin", cmd_admin))
+    app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CallbackQueryHandler(on_ui_button, pattern=r"^ui\|"))
+    app.add_handler(CallbackQueryHandler(on_admin_action, pattern=r"^adm\|"))
     app.add_handler(CallbackQueryHandler(on_media_action, pattern=r"^mx\|"))
+    app.add_handler(
+        MessageHandler(
+            filters.PHOTO | filters.VIDEO | filters.Document.ALL | filters.VOICE | filters.AUDIO,
+            on_admin_media,
+        )
+    )
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
     app.add_error_handler(on_error)
     return app
