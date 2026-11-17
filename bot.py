@@ -136,8 +136,9 @@ PENDING: dict[int, str] = {}
 # ملفات محفوظة مؤقتاً حتى تعمل الأزرار بلا إعادة تحميل
 CACHE_DIR = HERE / "_cache"
 JOBS: dict[str, dict[str, Any]] = {}
-JOB_TTL = 45 * 60
-MAX_JOBS = 6
+JOB_TTL = 3 * 60 * 60
+MAX_JOBS = int(os.getenv("MAX_JOBS", "12"))
+CACHE_MAX_BYTES = int(os.getenv("CACHE_MAX_MB", "350")) * 1024 * 1024
 
 # ----------------------------------------------------------------------------
 # نصوص الواجهة
@@ -465,6 +466,20 @@ def prune_jobs() -> None:
         job = JOBS.pop(t)
         Path(job["path"]).unlink(missing_ok=True)
     while len(JOBS) > MAX_JOBS:
+        t = min(JOBS, key=lambda k: JOBS[k]["ts"])
+        job = JOBS.pop(t)
+        Path(job["path"]).unlink(missing_ok=True)
+    # لا نملأ القرص: نسقط الأقدم حتى ينزل الحجم تحت الحد
+    def total() -> int:
+        s = 0
+        for j in JOBS.values():
+            try:
+                s += Path(j["path"]).stat().st_size
+            except OSError:
+                pass
+        return s
+
+    while JOBS and total() > CACHE_MAX_BYTES:
         t = min(JOBS, key=lambda k: JOBS[k]["ts"])
         job = JOBS.pop(t)
         Path(job["path"]).unlink(missing_ok=True)
